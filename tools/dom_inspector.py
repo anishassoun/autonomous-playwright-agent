@@ -43,7 +43,8 @@ EXTRACTION_JS = """
         seen.add(el);
 
         const tag = el.tagName.toLowerCase();
-        if (tag === 'input' && (el.type || '').toLowerCase() === 'hidden') {
+        const inputType = (el.type || '').toLowerCase();
+        if (tag === 'input' && inputType === 'hidden') {
             return;
         }
         if (!isVisible(el)) {
@@ -55,13 +56,26 @@ EXTRACTION_JS = """
             return val !== null && val.trim() !== '' ? val.trim() : null;
         };
 
-        // Extract visible text (avoiding huge container text dumps for forms)
+        // Extract visible text (avoiding huge container text dumps for forms/selects)
         let text = null;
-        if (tag === 'input' && ['submit', 'button', 'reset'].includes((el.type || '').toLowerCase())) {
+        if (tag === 'input' && ['submit', 'button', 'reset'].includes(inputType)) {
             text = el.value ? el.value.trim() : null;
-        } else if (tag !== 'form' && tag !== 'input') {
+        } else if (!['form', 'input', 'select'].includes(tag)) {
             const rawText = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ');
             text = rawText ? rawText.slice(0, 200) : null;
+        }
+
+        let options = null;
+        if (tag === 'select' && el.options) {
+            options = Array.from(el.options).map(opt => ({
+                value: opt.value,
+                text: (opt.text || '').trim()
+            }));
+        }
+
+        let checked = null;
+        if (tag === 'input' && ['checkbox', 'radio'].includes(inputType)) {
+            checked = Boolean(el.checked);
         }
 
         const item = {
@@ -74,7 +88,9 @@ EXTRACTION_JS = """
             role: getAttr('role') || el.ariaRoleDescription || null,
             data_testid: getAttr('data-testid') || getAttr('data-test'),
             aria_label: getAttr('aria-label'),
-            href: tag === 'a' ? getAttr('href') : null
+            href: tag === 'a' ? getAttr('href') : null,
+            checked: checked,
+            options: options
         };
 
         // Remove null/empty fields to keep JSON lightweight for LLM token efficiency

@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import time
 from typing import Optional
 import urllib.error
 import urllib.request
@@ -31,41 +32,35 @@ class GeneratedPlaywrightTest(BaseModel):
 
 
 SYSTEM_INSTRUCTION = r"""You are an expert QA Automation Engineer specializing in Python `pytest-playwright`.
-Your task is to write a complete, standalone, runnable Python test file that fulfills a given User Story on a target URL.
+Write a concise, standalone, runnable Python test file that fulfills the User Story on the Target URL.
 
 Follow these strict rules:
-1. Use ONLY the locators, IDs, names, placeholders, roles, or text present in the provided DOM JSON snapshot. Prefer `#<id>` CSS selectors (for example `page.locator("#user-name")`).
-2. `page.locator(selector)` takes ONLY ONE string argument (a CSS selector like `"#user-name"`). Never pass two arguments to `page.locator()`.
-3. Call `.fill(text)` and `.click()` directly on the Locator object (e.g. `self.username_input.fill(username)` and `self.login_button.click()`).
-4. Structure the code using the Page Object Model (POM) pattern within the same file following this exact pattern:
+1. Use ONLY the locators present in the DOM JSON snapshot. When an element has an `id`, ALWAYS use `page.locator("#<id>")` (e.g. `page.locator("#user-name")`, `page.locator("#login-button")`, `page.locator("#dropdown")`) without prefixing a tag name.
+2. `page.locator(selector)` takes ONLY ONE string argument.
+3. Structure the code using this exact Page Object template and ALWAYS call `pom.navigate("<Target URL>")` first inside `test_user_story(page: Page)`:
 
 ```python
 import re
 from playwright.sync_api import Page, expect
 
 
-class ExamplePage:
+class PageObject:
     def __init__(self, page: Page):
         self.page = page
-        self.some_input = page.locator("#input-id")
-        self.submit_btn = page.locator("#submit-id")
 
     def navigate(self, url: str):
         self.page.goto(url)
 
-    def submit_form(self, value: str):
-        self.some_input.fill(value)
-        self.submit_btn.click()
-
 
 def test_user_story(page: Page):
-    pom = ExamplePage(page)
+    pom = PageObject(page)
     pom.navigate("https://example.com")
-    pom.submit_form("test")
-    expect(page).to_have_url(re.compile(r".*/expected-path"))
+    # perform actions on page.locator(...) and end with expect(...)
 ```
 
-5. Output ONLY valid, runnable Python code without markdown explanations.
+4. Include ONLY the exact `expect(...)` check specified in the User Story. Do NOT invent extra URL assertions when the User Story checks an error message, checkbox, or dropdown value.
+5. Do NOT weaken, delete, or trivialize the `expect()` assertion to make the test pass. Only fix locators, navigation, or element interaction calls.
+6. Output ONLY the Python code block and stop immediately after the test function.
 """
 
 
@@ -77,15 +72,27 @@ def strip_markdown_fences(code: str) -> str:
         r"```(?:python|py)?\s*\n(.*?)```", cleaned, flags=re.DOTALL | re.IGNORECASE
     )
     if fenced_match:
-        return fenced_match.group(1).strip()
-
-    if cleaned.startswith("```"):
+        cleaned = fenced_match.group(1).strip()
+    elif cleaned.startswith("```"):
         lines = cleaned.splitlines()
         if lines and lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         cleaned = "\n".join(lines).strip()
+
+    # Ensure standard playwright/re imports are present if referenced in generated test code
+    header_imports = []
+    if "re." in cleaned and "import re" not in cleaned:
+        header_imports.append("import re")
+    if (
+        ("Page" in cleaned or "expect(" in cleaned)
+        and "from playwright.sync_api import Page, expect" not in cleaned
+    ):
+        header_imports.append("from playwright.sync_api import Page, expect")
+
+    if header_imports:
+        cleaned = "\n".join(header_imports) + "\n" + cleaned
 
     return cleaned
 
@@ -107,10 +114,16 @@ def _build_prompt(
             [
                 "\nPrevious Test Execution Failed! Fix the issues based on this pytest error output:",
                 error_feedback,
+                (
+                    "CRITICAL SELF-HEALING RULE: Do NOT weaken, delete, or trivialize the "
+                    "`expect()` assertion to make the test pass. Only fix locators, "
+                    "navigation, or element interaction calls. Replace any broken/stale "
+                    "selector with the matching `id` selector from the DOM JSON above."
+                ),
             ]
         )
     prompt_parts.append(
-        "\nReturn ONLY runnable Python pytest-playwright code using a Page Object Model class and a `def test_...(page: Page):` function."
+        f"\nWrite the complete corrected Python test starting with `pom.navigate('{url}')` inside `def test_user_story(page: Page):`."
     )
     return "\n\n".join(prompt_parts)
 
@@ -144,37 +157,48 @@ def _generate_with_gemini(prompt: str, api_key: str) -> str:
     return strip_markdown_fences(raw_text)
 
 
-def _generate_with_ollama(prompt: str) -> str:
+def _generate_with_ollama(prompt: str, is_retry: bool = False) -> str:
     ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
     ollama_model = os.getenv("OLLAMA_MODEL", "phi3:latest")
 
-    payload = {
-        "model": ollama_model,
-        "system": SYSTEM_INSTRUCTION,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": 0.1},
-    }
+    models_to_try = [ollama_model, "gemma3:270m"]
+    last_exc: Optional[Exception] = None
 
-    req = urllib.request.Request(
-        ollama_url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    for model_candidate in models_to_try:
+        payload = {
+            "model": model_candidate,
+            "system": SYSTEM_INSTRUCTION,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.2 if is_retry else 0.0,
+                "num_ctx": 2048,
+                "num_predict": 320,
+            },
+        }
 
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-            response_text = body.get("response", "")
-            cleaned_code = strip_markdown_fences(response_text)
-            validated = GeneratedPlaywrightTest(python_code=cleaned_code)
-            return validated.python_code
-    except urllib.error.URLError as exc:
-        raise RuntimeError(
-            f"Failed to connect to Ollama at {ollama_url} (model={ollama_model}). "
-            f"Ensure GEMINI_API_KEY is set in .env or Ollama is running locally. Error: {exc}"
-        ) from exc
+        req = urllib.request.Request(
+            ollama_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                response_text = body.get("response", "")
+                cleaned_code = strip_markdown_fences(response_text)
+                validated = GeneratedPlaywrightTest(python_code=cleaned_code)
+                return validated.python_code
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+            last_exc = exc
+            time.sleep(1)
+
+    raise RuntimeError(
+        f"Failed to connect or timed out waiting for Ollama at {ollama_url} "
+        f"(model={ollama_model}). Error: {last_exc}"
+    ) from last_exc
 
 
 def generate_playwright_test(
@@ -195,4 +219,4 @@ def generate_playwright_test(
     if api_key and api_key != "your_key_here":
         return _generate_with_gemini(prompt, api_key)
 
-    return _generate_with_ollama(prompt)
+    return _generate_with_ollama(prompt, is_retry=bool(error_feedback))
